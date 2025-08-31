@@ -20,6 +20,7 @@ import (
 	"github.com/getsops/sops/v3/cmd/sops/formats"
 	"github.com/getsops/sops/v3/decrypt"
 	"github.com/joho/godotenv"
+	"golang.org/x/sync/errgroup"
 	"sigs.k8s.io/kustomize/api/types"
 	"sigs.k8s.io/yaml"
 )
@@ -143,56 +144,129 @@ func generate(raw []byte) (string, error) {
 	}
 
 	var output bytes.Buffer
+	var g errgroup.Group
+	limit := 20
+	if l := os.Getenv("KSOPS_CONCURRENCY_LIMIT"); l != "" {
+		_, err := fmt.Sscanf(l, "%d", &limit)
+		if err != nil || limit < 1 {
+			return "", fmt.Errorf("error parsing KSOPS_CONCURRENCY_LIMIT value %q: %w", l, err)
+		}
+	}
+	g.SetLimit(limit)
 
-	for i, file := range manifest.Files {
-		data, err := decryptFile(file)
-		if err != nil {
-			return "", fmt.Errorf("error decrypting file %q from manifest.Files: %w", file, err)
+	if len(manifest.Files) > 0 {
+		results := make([][]byte, len(manifest.Files))
+
+		for i, file := range manifest.Files {
+			g.Go(func() error {
+				data, err := decryptFile(file)
+				if err != nil {
+					return fmt.Errorf("error decrypting file %q from manifest.Files: %w", file, err)
+				}
+				results[i] = data
+				return nil
+			})
 		}
 
-		output.Write(data)
-		// KRM treats will try parse (and fail) empty documents if there is a trailing separator
-		if i < (len(manifest.Files)+len(manifest.SecretFrom))-1 {
-			output.WriteString("\n---\n")
+		if err := g.Wait(); err != nil {
+			return "", err
 		}
+
+		for i, data := range results {
+			output.Write(data)
+			// KRM treats will try parse (and fail) empty documents if there is a trailing separator
+			if i < (len(manifest.Files)+len(manifest.SecretFrom))-1 {
+				output.WriteString("\n---\n")
+			}
+		}
+	}
+
+	type result struct {
+		key  string
+		data []byte
 	}
 
 	for i, secretFrom := range manifest.SecretFrom {
 		stringData := make(map[string]string)
 		binaryData := make(map[string]string)
 
-		for _, file := range secretFrom.Files {
-			key, path := fileKeyPath(file)
-			data, err := decryptFile(path)
-			if err != nil {
-				return "", fmt.Errorf("error decrypting file %q from secretFrom.Files: %w", path, err)
+		if len(secretFrom.Files) > 0 {
+			results := make([]result, len(secretFrom.Files))
+
+			for i, file := range secretFrom.Files {
+				i, file := i, file
+				g.Go(func() error {
+					key, path := fileKeyPath(file)
+					data, err := decryptFile(path)
+					if err != nil {
+						return fmt.Errorf("error decrypting file %q from secretFrom.Files: %w", path, err)
+					}
+					results[i] = result{key: key, data: data}
+					return nil
+				})
 			}
 
-			stringData[key] = string(data)
+			if err := g.Wait(); err != nil {
+				return "", err
+			}
+
+			for _, result := range results {
+				stringData[result.key] = string(result.data)
+			}
 		}
 
-		for _, file := range secretFrom.BinaryFiles {
-			key, path := fileKeyPath(file)
-			data, err := decryptFile(path)
-			if err != nil {
-				return "", fmt.Errorf("error decrypting file %q from secretFrom.Files: %w", path, err)
+		if len(secretFrom.BinaryFiles) > 0 {
+			binaryResults := make([]result, len(secretFrom.BinaryFiles))
+
+			for i, file := range secretFrom.BinaryFiles {
+				i, file := i, file
+				g.Go(func() error {
+					key, path := fileKeyPath(file)
+					data, err := decryptFile(path)
+					if err != nil {
+						return fmt.Errorf("error decrypting file %q from secretFrom.BinaryFiles: %w", path, err)
+					}
+					binaryResults[i] = result{key: key, data: data}
+					return nil
+				})
 			}
 
-			binaryData[key] = base64.StdEncoding.EncodeToString(data)
+			if err := g.Wait(); err != nil {
+				return "", err
+			}
+
+			for _, result := range binaryResults {
+				binaryData[result.key] = base64.StdEncoding.EncodeToString(result.data)
+			}
 		}
 
-		for _, file := range secretFrom.Envs {
-			data, err := decryptFile(file)
-			if err != nil {
-				return "", fmt.Errorf("error decrypting file %q from secretFrom.Envs: %w", file, err)
+		if len(secretFrom.Envs) > 0 {
+			envResults := make([]result, len(secretFrom.Envs))
+
+			for i, file := range secretFrom.Envs {
+				i, file := i, file
+				g.Go(func() error {
+					data, err := decryptFile(file)
+					if err != nil {
+						return fmt.Errorf("error decrypting file %q from secretFrom.Envs: %w", file, err)
+					}
+					envResults[i] = result{key: file, data: data}
+					return nil
+				})
 			}
 
-			env, err := godotenv.Unmarshal(string(data))
-			if err != nil {
-				return "", fmt.Errorf("error unmarshalling .env file %q: %w", file, err)
+			if err := g.Wait(); err != nil {
+				return "", err
 			}
-			for k, v := range env {
-				stringData[k] = v
+
+			for _, result := range envResults {
+				env, err := godotenv.Unmarshal(string(result.data))
+				if err != nil {
+					return "", fmt.Errorf("error unmarshalling .env file %q: %w", result.key, err)
+				}
+				for k, v := range env {
+					stringData[k] = v
+				}
 			}
 		}
 
